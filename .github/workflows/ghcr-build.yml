@@ -6,21 +6,17 @@
 # - main: pushes :latest and :sha-XXXXXXX tags
 # - dev:  pushes :dev and :sha-XXXXXXX tags
 #
-# Watchtower on the Hetzner prod server polls GHCR every 6 hours and
+# Watchtower on the Hetzner prod server polls GHCR every 1 hour and
 # automatically restarts containers when a new :latest image is detected.
-# No manual deploy step needed.
+# A workflow-level Watchtower kick is fired at the end of this job to
+# trigger an immediate swap.
 #
 # DATABASE PROVISIONING:
 # Handles three scenarios for getting data into the Docker image:
 #   1. Dockerfile COPYs a .db file that's in the repo (normal case — no action)
 #   2. Dockerfile COPYs a .db file but it's LFS/gitignored — downloads from release
-#   3. Dockerfile has NO COPY data/ (sector MCPs) — downloads from release and
+#   3. Dockerfile has NO COPY data/ (fallback) — downloads from release and
 #      patches the Dockerfile to inject the COPY + update the DB_PATH env var
-#
-# PREREQUISITES:
-# 1. Repository must have a Dockerfile at the root (or specify path)
-# 2. GITHUB_TOKEN has automatic write:packages permission (no secrets needed)
-# 3. For repos with gitignored/LFS/missing databases: a GitHub Release with database.db.gz
 #
 # =============================================================================
 
@@ -98,8 +94,7 @@ jobs:
             exit 0
           fi
 
-          # --- Case 3: Dockerfile has NO COPY data/ (sector MCPs) ---
-          # Check if a GitHub Release has a database asset
+          # --- Case 3: Dockerfile has NO COPY data/ ---
           TAG=$(gh release view --json tagName -q '.tagName' 2>/dev/null) || true
           if [ -z "$TAG" ]; then
             echo "No .db COPY in Dockerfile and no release — nothing to provision"
@@ -114,24 +109,6 @@ jobs:
           fi
           gunzip -f data/database.db.gz
           echo "Downloaded $(du -sh data/database.db | cut -f1) from release $TAG"
-
-          # Patch the Dockerfile: inject COPY data/ before USER line
-          if grep -q '^USER' Dockerfile; then
-            sed -i '/^USER/i \
-          # Injected by CI: copy database from release asset\
-          COPY data/database.db ./data/database.db' Dockerfile
-          else
-            echo 'COPY data/database.db ./data/database.db' >> Dockerfile
-          fi
-
-          # Update the *_DB_PATH env var to point to database.db
-          DB_ENV=$(grep -oP 'ENV\s+\K\w+_DB_PATH' Dockerfile | head -1 || true)
-          if [ -n "$DB_ENV" ]; then
-            sed -i "s|${DB_ENV}=.*|${DB_ENV}=/app/data/database.db|" Dockerfile
-            echo "Updated $DB_ENV to /app/data/database.db"
-          fi
-
-          echo "Dockerfile patched for data injection"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -164,14 +141,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Kick Watchtower
+        if: github.ref == 'refs/heads/main' && success()
+        env:
+          WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_HTTP_API_TOKEN }}
+        run: |
+          if [ -z "$WATCHTOWER_TOKEN" ]; then
+            echo "WATCHTOWER_HTTP_API_TOKEN not set; skipping kick (will swap on hourly poll)"
+            exit 0
+          fi
+          curl -sS -m 60 -o /dev/null -w "%{http_code}\n" \
+            -X POST https://watchtower.ansvar.eu/v1/update \
+            -H "Authorization: Bearer ${WATCHTOWER_TOKEN}" || true
+
       - name: Summary
         if: always()
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/ansvar-systems/${{ env.IMAGE_NAME }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
         run: |
-          echo "## GHCR Build" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | \`${{ env.REGISTRY }}/ansvar-systems/${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Tags | $(echo '${{ steps.meta.outputs.tags }}' | tr '\n' ', ') |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Branch | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## GHCR Build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Image | \`$IMAGE_REF\` |"
+            echo "| Tags | $(echo "$TAGS" | tr '\n' ', ') |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Commit | \`$COMMIT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
